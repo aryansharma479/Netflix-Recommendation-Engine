@@ -1,0 +1,972 @@
+app.py working:
+import streamlit as st
+import pandas as pd
+
+from src.data_loader import load_raw_data, merge_movies_and_metadata, build_full_ratings_table
+from src.features import (
+    clean_full_table,
+    build_text_embeddings,
+    compute_user_features,
+    compute_movie_features,
+    build_interaction_dataset,
+    build_movie_embedding_matrix,
+)
+from src.models import train_val_test_split, train_models
+from src.recommender import build_user_profile, recommend_for_user, get_similar_movies
+
+
+st.set_page_config(
+    page_title="Netflix Recommendation ML Pipeline",
+    layout="wide",
+)
+
+
+@st.cache_data(show_spinner=True)
+def load_and_prepare():
+    ratings, movies, meta, genome_tags, genome_scores = load_raw_data()
+    movies_full = merge_movies_and_metadata(movies, meta)
+    full = build_full_ratings_table(ratings, movies_full)
+    full = clean_full_table(full)
+
+    text_emb_df, tfidf, svd = build_text_embeddings(movies_full)
+
+    user_features = compute_user_features(full)
+    movie_features = compute_movie_features(full)
+    movie_emb_df = build_movie_embedding_matrix(movie_features, text_emb_df)
+
+    X, y, meta_X, enriched_df = build_interaction_dataset(
+        full, user_features, movie_features, text_emb_df
+    )
+
+    return {
+        "ratings": ratings,
+        "movies": movies,
+        "movies_full": movies_full,
+        "full": enriched_df,
+        "user_features": user_features,
+        "movie_features": movie_features,
+        "movie_emb_df": movie_emb_df,
+        "X": X,
+        "y": y,
+        "meta_X": meta_X,
+    }
+
+
+@st.cache_resource(show_spinner=True)
+def train_all_models(X, y, meta_X):
+    splits = train_val_test_split(X, y, meta_X)
+    models, metrics_df = train_models(splits)
+    return models, metrics_df, splits
+
+
+def main():
+    st.title("🎬 Netflix Recommendation ML Pipeline")
+    st.markdown(
+        """
+        Builds an end-to-end ML system with:
+        - Data cleaning & feature engineering  
+        - User profiles & rating behaviour  
+        - NLP-driven content embeddings (TF-IDF + SVD)  
+        - Multiple models (LogReg, RF, XGBoost/GBM)  
+        - Personalized recommendations & similar content
+        """
+    )
+
+    data = load_and_prepare()
+
+    full = data["full"]
+    movies_full = data["movies_full"]
+    user_features = data["user_features"]
+    movie_features = data["movie_features"]
+    movie_emb_df = data["movie_emb_df"]
+    X, y, meta_X = data["X"], data["y"], data["meta_X"]
+
+    models, metrics_df, splits = train_all_models(X, y, meta_X)
+
+    tab_eda, tab_models, tab_user, tab_similar = st.tabs(
+        ["📊 Data & EDA", "🤖 Models", "👤 Recommendations", "🎞 Similar Content"]
+    )
+
+    # ------------------ TAB 1: EDA ------------------
+    with tab_eda:
+        st.subheader("Dataset Overview")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Users", full["userId"].nunique())
+        c2.metric("Movies", full["movieId"].nunique())
+        c3.metric("Ratings", len(full))
+        c4.metric("Avg Rating", round(full["rating"].mean(), 2))
+
+        st.markdown("### Sample Interactions")
+        st.dataframe(full.head())
+
+        st.markdown("### Rating Distribution")
+        if "rating" not in full.columns:
+            st.error("'rating' column missing.")
+            st.write("Columns:", list(full.columns))
+        else:
+            counts = full["rating"].value_counts().sort_index()
+            rating_counts = pd.DataFrame(
+                {"rating": counts.index.astype(float), "count": counts.values}
+            )
+            st.bar_chart(rating_counts.set_index("rating"))
+
+        st.markdown("### Top Genres")
+        if "genres" in full.columns:
+            tmp = full["genres"].fillna("").str.split("|").explode()
+            tmp = tmp[tmp != ""]
+            genre_counts = tmp.value_counts().head(15).to_frame("count")
+            st.bar_chart(genre_counts)
+        else:
+            st.info("No 'genres' column available.")
+
+    # ------------------ TAB 2: MODELS ------------------
+    with tab_models:
+        st.subheader("Model Performance (Validation & Test)")
+
+        if metrics_df.empty:
+            st.error("No metrics computed.")
+        else:
+            st.dataframe(
+                metrics_df.pivot_table(
+                    index="model",
+                    columns="split",
+                    values=["accuracy", "precision", "recall", "f1", "roc_auc"],
+                ).round(3)
+            )
+
+            st.markdown("#### Test F1 & ROC-AUC")
+            test_metrics = metrics_df[metrics_df["split"] == "test"].set_index("model")
+            chart_df = test_metrics[["f1", "roc_auc"]]
+            st.bar_chart(chart_df)
+
+            st.info(
+                """
+                - **F1** balances precision & recall.  
+                - **ROC-AUC** captures how well the model ranks liked vs disliked items.  
+                In production you usually pick the model with best balance for your business goal
+                (e.g. favour precision if you really want to avoid bad suggestions).
+                """
+            )
+
+    # ------------------ TAB 3: USER PROFILES & RECS ------------------
+    with tab_user:
+        st.subheader("User Profiles & Personalized Recommendations")
+
+        user_ids = sorted(full["userId"].unique())
+        user_id = st.selectbox("Choose a user", user_ids)
+
+        profile = build_user_profile(full, user_id)
+        if "error" in profile:
+            st.warning(profile["error"])
+        else:
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown("#### Rating Behaviour")
+                st.write(f"User ID: **{profile['user_id']}**")
+                st.write(f"Average rating: **{profile['avg_rating']:.2f}**")
+                st.write(f"Total ratings: **{profile['n_ratings']}**")
+                st.write(f"Behaviour: **{profile['behaviour']}**")
+                if profile["recent_like_ratio"] is not None:
+                    st.write(
+                        f"Likes recent releases: **{profile['recent_like_ratio']:.2f}** (fraction of recent movies rated ≥ 4)"
+                    )
+
+            with col_r:
+                st.markdown("#### Content Preferences")
+                st.write("Top genres:", ", ".join(profile["top_genres"]) or "N/A")
+                st.write("Top actors:", ", ".join(profile["top_actors"]) or "N/A")
+                st.write("Top directors:", ", ".join(profile["top_directors"]) or "N/A")
+
+        st.markdown("---")
+        st.markdown("### Recommended Movies")
+
+        model_name = st.selectbox("Model", list(models.keys()))
+        top_n = st.slider("Number of recommendations", 5, 30, 10)
+
+        if st.button("Get Recommendations"):
+            model = models[model_name]
+            recs = recommend_for_user(
+                user_id=user_id,
+                model=model,
+                user_features=user_features,
+                movie_features=movie_features,
+                movie_emb_df=movie_emb_df,
+                full=full,
+                movies_full=movies_full,
+                top_n=top_n,
+            )
+            if recs.empty:
+                st.warning("No recommendations could be generated for this user.")
+            else:
+                for _, row in recs.iterrows():
+                    with st.container():
+                        c_img, c_txt = st.columns([1, 3])
+                        with c_img:
+                            if isinstance(row.get("poster_url"), str) and row["poster_url"]:
+                                st.image(row["poster_url"], use_container_width=True)
+                        with c_txt:
+                            st.markdown(f"**{row['title']}**")
+                            st.write(row.get("genres", ""))
+                            st.write(f"Predicted like probability: **{row['pred_like_proba']:.3f}**")
+
+    # ------------------ TAB 4: SIMILAR CONTENT ------------------
+    with tab_similar:
+        st.subheader("Content-Based Similar Movies")
+
+        movie_choices = movies_full[["movieId", "title"]].drop_duplicates()
+        movie_choices["label"] = (
+            movie_choices["title"] + " (ID: " + movie_choices["movieId"].astype(str) + ")"
+        )
+        label = st.selectbox(
+            "Reference movie", movie_choices["label"].tolist()
+        )
+        movie_id = int(
+            movie_choices.loc[movie_choices["label"] == label, "movieId"].iloc[0]
+        )
+
+        similar_df = get_similar_movies(
+            movie_id=movie_id,
+            movie_emb_df=movie_emb_df,
+            movies_full=movies_full,
+            top_n=15,
+        )
+
+        if similar_df.empty:
+            st.warning("No similar movies found.")
+        else:
+            for _, row in similar_df.iterrows():
+                with st.container():
+                    c_img, c_txt = st.columns([1, 3])
+                    with c_img:
+                        if isinstance(row.get("poster_url"), str) and row["poster_url"]:
+                            st.image(row["poster_url"], use_container_width=True)
+                    with c_txt:
+                        st.markdown(f"**{row['title']}**")
+                        st.write(row.get("genres", ""))
+                        st.write(f"Similarity score: **{row['similarity']:.3f}**")
+
+            st.info(
+                """
+                Similarity is computed using:
+                - TF-IDF + SVD embeddings of the **overview** text  
+                - Combined with numerical movie features (ratings, popularity, recency)  
+                using cosine similarity.
+                """
+            )
+
+
+if __name__ == "__main__":
+    main()
+
+
+config.py working :
+import os
+
+# Base paths
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+
+# File names
+RATINGS_FILE = "ratings.csv"
+MOVIES_FILE = "movies.csv"
+META_FILE = "movie_metadata.csv"
+GENOME_TAGS_FILE = "genome-tags.csv"
+GENOME_SCORES_FILE = "genome-scores.csv"
+
+# Modelling constants
+LIKE_THRESHOLD = 4.0          # rating >= 4 => like
+RANDOM_STATE = 42
+N_TEXT_COMPONENTS = 50        # SVD components for overview text
+
+NEW_RELEASE_YEAR = 2010
+CURRENT_YEAR_FOR_RECENCY = 2016  # approx for MovieLens-like data
+
+
+data_loader.py working :
+import os
+import pandas as pd
+from .config import (
+    DATA_DIR,
+    RATINGS_FILE,
+    MOVIES_FILE,
+    META_FILE,
+    GENOME_TAGS_FILE,
+    GENOME_SCORES_FILE,
+)
+
+
+def load_raw_data(data_dir: str = DATA_DIR):
+    """Load raw CSVs from the data directory."""
+    ratings_path = os.path.join(data_dir, RATINGS_FILE)
+    movies_path = os.path.join(data_dir, MOVIES_FILE)
+    meta_path = os.path.join(data_dir, META_FILE)
+    genome_tags_path = os.path.join(data_dir, GENOME_TAGS_FILE)
+    genome_scores_path = os.path.join(data_dir, GENOME_SCORES_FILE)
+
+    ratings = pd.read_csv(ratings_path)
+    movies = pd.read_csv(movies_path)
+    meta = pd.read_csv(meta_path)
+    genome_tags = pd.read_csv(genome_tags_path)
+    genome_scores = pd.read_csv(genome_scores_path)
+
+    if "rating" not in ratings.columns:
+        raise ValueError(
+            f"'rating' column missing in ratings.csv. "
+            f"Columns found: {ratings.columns.tolist()}"
+        )
+
+    return ratings, movies, meta, genome_tags, genome_scores
+
+
+def merge_movies_and_metadata(movies: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge MovieLens movies with metadata.
+    We keep MovieLens title + genres as canonical, and rename
+    metadata genres to genres_meta to avoid x/y suffixes.
+    """
+    meta_clean = meta.copy()
+
+    # Avoid clashing with MovieLens columns
+    if "title" in meta_clean.columns:
+        meta_clean = meta_clean.drop(columns=["title"])
+
+    if "genres" in meta_clean.columns:
+        meta_clean = meta_clean.rename(columns={"genres": "genres_meta"})
+
+    movies_full = movies.merge(meta_clean, on="movieId", how="left")
+    # movies_full now has: movieId, title, genres, tmdb_id, overview, poster_url, genres_meta, actors, ...
+    return movies_full
+
+
+def build_full_ratings_table(
+    ratings: pd.DataFrame, movies_full: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Join ratings with movie+metadata table.
+    """
+    full = ratings.merge(movies_full, on="movieId", how="left")
+    return full
+
+
+features.py working :
+from typing import Tuple, Dict
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+
+from .config import (
+    LIKE_THRESHOLD,
+    RANDOM_STATE,
+    N_TEXT_COMPONENTS,
+    NEW_RELEASE_YEAR,
+    CURRENT_YEAR_FOR_RECENCY,
+)
+
+
+def clean_full_table(full: pd.DataFrame) -> pd.DataFrame:
+    """Basic NA handling and type fixes on the interaction table."""
+    df = full.copy()
+
+    # Text fields
+    for col in ["overview", "genres", "genres_meta", "actors", "directors"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+
+    # Release year: numeric and fill from title if missing
+    if "release_year" in df.columns:
+        df["release_year"] = df["release_year"].fillna(0).astype(int)
+        mask_zero = df["release_year"] == 0
+
+        if "title" in df.columns:
+            inferred = (
+                df.loc[mask_zero, "title"].astype(str)
+                .str.extract(r"\((\d{4})\)")
+                .iloc[:, 0]
+            )
+            df.loc[mask_zero, "release_year"] = inferred.fillna(0).astype(int)
+
+        median_year = df.loc[df["release_year"] > 0, "release_year"].median()
+        df["release_year"] = df["release_year"].replace(0, median_year).astype(int)
+
+    # rating
+    if "rating" in df.columns:
+        df["rating"] = df["rating"].astype(float)
+
+    return df
+
+
+def build_text_embeddings(movies_full: pd.DataFrame):
+    """
+    TF-IDF + SVD embeddings for movie overview text.
+    """
+    texts = movies_full["overview"].fillna("").astype(str).values
+
+    tfidf = TfidfVectorizer(
+        max_features=5000,
+        stop_words="english",
+        ngram_range=(1, 2),
+    )
+    tfidf_matrix = tfidf.fit_transform(texts)
+
+    svd = TruncatedSVD(
+        n_components=N_TEXT_COMPONENTS,
+        random_state=RANDOM_STATE,
+    )
+    reduced = svd.fit_transform(tfidf_matrix)
+
+    emb_df = pd.DataFrame(
+        reduced,
+        index=movies_full["movieId"].values,
+        columns=[f"nlp_{i}" for i in range(N_TEXT_COMPONENTS)],
+    )
+    return emb_df, tfidf, svd
+
+
+def compute_user_features(full: pd.DataFrame) -> pd.DataFrame:
+    """User-level profile features."""
+    df = full.copy()
+    df["like"] = (df["rating"] >= LIKE_THRESHOLD).astype(int)
+
+    stats = df.groupby("userId")["rating"].agg(["mean", "std", "count"])
+    stats.rename(
+        columns={
+            "mean": "user_avg_rating",
+            "std": "user_rating_std",
+            "count": "user_rating_count",
+        },
+        inplace=True,
+    )
+
+    like_ratio = df.groupby("userId")["like"].mean().to_frame("user_like_ratio")
+
+    if "release_year" in df.columns:
+        df["is_new_release"] = (df["release_year"] >= NEW_RELEASE_YEAR).astype(int)
+        new_release_pref = (
+            df.groupby("userId")["is_new_release"]
+            .mean()
+            .to_frame("user_new_release_ratio")
+        )
+    else:
+        new_release_pref = pd.DataFrame(
+            {"user_new_release_ratio": 0.0}, index=stats.index
+        )
+
+    strictness = (5.0 - stats["user_avg_rating"]).to_frame("user_strictness")
+
+    user_features = (
+        stats.join(like_ratio)
+        .join(new_release_pref, how="left")
+        .join(strictness)
+    )
+    user_features["user_rating_std"] = user_features["user_rating_std"].fillna(0.0)
+
+    return user_features
+
+
+def compute_movie_features(full: pd.DataFrame) -> pd.DataFrame:
+    """Movie-level stats & popularity."""
+    df = full.copy()
+    df["like"] = (df["rating"] >= LIKE_THRESHOLD).astype(int)
+
+    stats = df.groupby("movieId")["rating"].agg(["mean", "count"])
+    stats.rename(
+        columns={
+            "mean": "movie_avg_rating",
+            "count": "movie_rating_count",
+        },
+        inplace=True,
+    )
+
+    like_ratio = df.groupby("movieId")["like"].mean().to_frame("movie_like_ratio")
+
+    stats["movie_popularity"] = np.log1p(stats["movie_rating_count"])
+
+    recency = df.groupby("movieId")["release_year"].median().to_frame("release_year")
+    recency["years_since_release"] = CURRENT_YEAR_FOR_RECENCY - recency["release_year"]
+    recency["years_since_release"] = recency["years_since_release"].clip(lower=0)
+    recency["is_trending"] = (recency["release_year"] >= NEW_RELEASE_YEAR).astype(int)
+
+    movie_features = stats.join(like_ratio).join(recency)
+    return movie_features
+
+
+def build_interaction_dataset(
+    full: pd.DataFrame,
+    user_features: pd.DataFrame,
+    movie_features: pd.DataFrame,
+    text_emb_df: pd.DataFrame,
+):
+    """
+    Build per (user, movie) rows with engineered features & target.
+    """
+    df = full.copy()
+    df["like"] = (df["rating"] >= LIKE_THRESHOLD).astype(int)
+
+    # Avoid duplicate release_year when joining movie_features
+    if "release_year" in df.columns:
+        df.drop(columns=["release_year"], inplace=True)
+
+    df = df.join(user_features, on="userId", how="left")
+    df = df.join(movie_features, on="movieId", how="left")
+    df = df.join(text_emb_df, on="movieId", how="left")
+
+    # User favourite genre match
+    if "genres" in df.columns:
+        tmp = df[["userId", "genres"]].copy()
+        tmp["genres_list"] = tmp["genres"].fillna("").str.split("|")
+        tmp = tmp.explode("genres_list")
+        tmp = tmp[tmp["genres_list"] != ""]
+        fav_genre = (
+            tmp.groupby(["userId", "genres_list"])
+            .size()
+            .reset_index(name="cnt")
+            .sort_values(["userId", "cnt"], ascending=[True, False])
+        )
+        fav_genre = fav_genre.drop_duplicates("userId").set_index("userId")[
+            "genres_list"
+        ]
+        df["user_fav_genre"] = df["userId"].map(fav_genre)
+        df["user_fav_genre_match"] = df.apply(
+            lambda row: int(
+                isinstance(row["user_fav_genre"], str)
+                and isinstance(row["genres"], str)
+                and row["user_fav_genre"] in row["genres"].split("|")
+            ),
+            axis=1,
+        )
+    else:
+        df["user_fav_genre_match"] = 0
+
+    nlp_cols = [c for c in df.columns if c.startswith("nlp_")]
+
+    feature_cols = [
+        "user_avg_rating",
+        "user_rating_std",
+        "user_rating_count",
+        "user_like_ratio",
+        "user_new_release_ratio",
+        "user_strictness",
+        "movie_avg_rating",
+        "movie_rating_count",
+        "movie_popularity",
+        "movie_like_ratio",
+        "release_year",
+        "years_since_release",
+        "is_trending",
+        "user_fav_genre_match",
+    ] + nlp_cols
+
+    feature_cols = [c for c in feature_cols if c in df.columns]
+
+    X = df[feature_cols].fillna(0.0)
+    y = df["like"].astype(int)
+    meta = df[["userId", "movieId"]].copy()
+
+    return X, y, meta, df
+
+
+def build_movie_embedding_matrix(
+    movie_features: pd.DataFrame,
+    text_emb_df: pd.DataFrame,
+) -> pd.DataFrame:
+    emb = movie_features.join(text_emb_df, how="left")
+    emb = emb.fillna(0.0)
+    return emb
+
+models.py working :
+from typing import Dict, Tuple
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+from .config import RANDOM_STATE
+
+try:
+    from xgboost import XGBClassifier
+except ImportError:
+    XGBClassifier = None
+
+
+def _ensure_no_cold_start_users(
+    X_train, X_test, y_train, y_test, meta_train, meta_test
+):
+    train_users = set(meta_train["userId"].unique())
+    test_users = set(meta_test["userId"].unique())
+
+    cold_users = test_users - train_users
+    if not cold_users:
+        return X_train, X_test, y_train, y_test, meta_train, meta_test
+
+    mask_cold = meta_test["userId"].isin(cold_users)
+    X_move = X_test[mask_cold]
+    y_move = y_test[mask_cold]
+    meta_move = meta_test[mask_cold]
+
+    X_test = X_test[~mask_cold]
+    y_test = y_test[~mask_cold]
+    meta_test = meta_test[~mask_cold]
+
+    X_train = pd.concat([X_train, X_move], axis=0)
+    y_train = pd.concat([y_train, y_move], axis=0)
+    meta_train = pd.concat([meta_train, meta_move], axis=0)
+
+    return X_train, X_test, y_train, y_test, meta_train, meta_test
+
+
+def train_val_test_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    meta: pd.DataFrame,
+    test_size: float = 0.2,
+    val_size: float = 0.1,
+) -> Dict[str, pd.DataFrame]:
+
+    X_train_val, X_test, y_train_val, y_test, meta_train_val, meta_test = train_test_split(
+        X, y, meta,
+        test_size=test_size,
+        stratify=y,
+        random_state=RANDOM_STATE,
+    )
+
+    val_fraction = val_size / (1.0 - test_size)
+    X_train, X_val, y_train, y_val, meta_train, meta_val = train_test_split(
+        X_train_val, y_train_val, meta_train_val,
+        test_size=val_fraction,
+        stratify=y_train_val,
+        random_state=RANDOM_STATE,
+    )
+
+    X_train, X_test, y_train, y_test, meta_train, meta_test = _ensure_no_cold_start_users(
+        X_train, X_test, y_train, y_test, meta_train, meta_test
+    )
+
+    return {
+        "X_train": X_train,
+        "y_train": y_train,
+        "meta_train": meta_train,
+        "X_val": X_val,
+        "y_val": y_val,
+        "meta_val": meta_val,
+        "X_test": X_test,
+        "y_test": y_test,
+        "meta_test": meta_test,
+    }
+
+
+def build_model_pipelines() -> Dict[str, object]:
+    models: Dict[str, object] = {}
+
+    logreg = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
+        ]
+    )
+    models["logistic_regression"] = logreg
+
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    models["random_forest"] = rf
+
+    if XGBClassifier is not None:
+        xgb = XGBClassifier(
+            n_estimators=300,
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+        models["xgboost"] = xgb
+    else:
+        gb = GradientBoostingClassifier(
+            n_estimators=200,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=RANDOM_STATE,
+        )
+        models["gradient_boosting"] = gb
+
+    return models
+
+
+def _metrics(y_true, y_pred, y_proba=None):
+    acc = accuracy_score(y_true, y_pred)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0
+    )
+    out = {
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+    if y_proba is not None:
+        try:
+            auc = roc_auc_score(y_true, y_proba)
+        except Exception:
+            auc = np.nan
+        out["roc_auc"] = auc
+    return out
+
+
+def train_models(
+    splits: Dict[str, pd.DataFrame],
+) -> Tuple[Dict[str, object], pd.DataFrame]:
+
+    X_train = splits["X_train"]
+    y_train = splits["y_train"]
+    X_val = splits["X_val"]
+    y_val = splits["y_val"]
+    X_test = splits["X_test"]
+    y_test = splits["y_test"]
+
+    models = build_model_pipelines()
+    results = []
+    fitted = {}
+
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        fitted[name] = model
+
+        # VAL
+        y_val_pred = model.predict(X_val)
+        y_val_proba = (
+            model.predict_proba(X_val)[:, 1]
+            if hasattr(model, "predict_proba")
+            else None
+        )
+        m_val = _metrics(y_val, y_val_pred, y_val_proba)
+        m_val.update({"model": name, "split": "val"})
+        results.append(m_val)
+
+        # TEST
+        y_test_pred = model.predict(X_test)
+        y_test_proba = (
+            model.predict_proba(X_test)[:, 1]
+            if hasattr(model, "predict_proba")
+            else None
+        )
+        m_test = _metrics(y_test, y_test_pred, y_test_proba)
+        m_test.update({"model": name, "split": "test"})
+        results.append(m_test)
+
+    metrics_df = pd.DataFrame(results)
+    return fitted, metrics_df
+
+recommender.py working :
+from typing import Dict
+import numpy as np
+import pandas as pd
+
+
+def build_user_profile(full: pd.DataFrame, user_id: int) -> Dict:
+    df_u = full[full["userId"] == user_id].copy()
+    if df_u.empty:
+        return {"error": f"No data for user {user_id}"}
+
+    avg_rating = df_u["rating"].mean()
+    rating_std = df_u["rating"].std()
+    n_ratings = df_u.shape[0]
+
+    if avg_rating >= 4.2:
+        behaviour = "Very generous rater"
+    elif avg_rating >= 3.6:
+        behaviour = "Slightly generous"
+    elif avg_rating >= 3.0:
+        behaviour = "Balanced"
+    else:
+        behaviour = "Strict rater"
+
+    if "release_year" in df_u.columns:
+        recent_mask = df_u["release_year"] >= 2010
+        recent_like_ratio = (
+            (df_u.loc[recent_mask, "rating"] >= 4).mean()
+            if recent_mask.any()
+            else np.nan
+        )
+    else:
+        recent_like_ratio = np.nan
+
+    def _top(col, sep="|", n=5):
+        vals = df_u[col].fillna("").astype(str).str.split(sep)
+        vals = vals.explode()
+        vals = vals[vals != ""]
+        if vals.empty:
+            return []
+        return vals.value_counts().head(n).index.tolist()
+
+    top_genres = _top("genres", "|", 5) if "genres" in df_u.columns else []
+    top_actors = _top("actors", "|", 5) if "actors" in df_u.columns else []
+    top_directors = _top("directors", "|", 5) if "directors" in df_u.columns else []
+
+    profile = {
+        "user_id": int(user_id),
+        "avg_rating": float(avg_rating),
+        "rating_std": float(0 if pd.isna(rating_std) else rating_std),
+        "n_ratings": int(n_ratings),
+        "behaviour": behaviour,
+        "top_genres": top_genres,
+        "top_actors": top_actors,
+        "top_directors": top_directors,
+        "recent_like_ratio": None if pd.isna(recent_like_ratio) else float(recent_like_ratio),
+    }
+    return profile
+
+
+def recommend_for_user(
+    user_id: int,
+    model,
+    user_features: pd.DataFrame,
+    movie_features: pd.DataFrame,
+    movie_emb_df: pd.DataFrame,
+    full: pd.DataFrame,
+    movies_full: pd.DataFrame,
+    top_n: int = 10,
+) -> pd.DataFrame:
+
+    if user_id not in user_features.index:
+        return pd.DataFrame()
+
+    seen = set(full.loc[full["userId"] == user_id, "movieId"].unique())
+    candidate_movie_ids = [m for m in movie_features.index if m not in seen]
+    if not candidate_movie_ids:
+        return pd.DataFrame()
+
+    uf = user_features.loc[[user_id]]
+    mf = movie_features.loc[candidate_movie_ids]
+    emb = movie_emb_df.loc[candidate_movie_ids]
+
+    uf_rep = pd.concat([uf] * len(candidate_movie_ids), ignore_index=True)
+    uf_rep.index = candidate_movie_ids
+
+    nlp_cols = [c for c in emb.columns if c.startswith("nlp_")]
+
+        # ----------------------------------------
+    # Compute user_fav_genre_match (NEW FIX)
+    # ----------------------------------------
+    # Determine user's favourite genre
+    fav_genre_series = full.loc[full["userId"] == user_id, "genres"].fillna("").str.split("|")
+    fav_genres_all = fav_genre_series.explode()
+    fav_genres_all = fav_genres_all[fav_genres_all != ""]
+    fav_genre = fav_genres_all.value_counts().idxmax() if len(fav_genres_all) > 0 else None
+
+    # Compute match for each candidate movie
+    fav_match_list = []
+    for mid in candidate_movie_ids:
+        movie_gen = movies_full.loc[movies_full["movieId"] == mid, "genres"].values
+        if len(movie_gen) > 0 and isinstance(movie_gen[0], str):
+            genres_split = movie_gen[0].split("|")
+            fav_match_list.append(int(fav_genre in genres_split) if fav_genre else 0)
+        else:
+            fav_match_list.append(0)
+
+    fav_match_series = pd.Series(
+        fav_match_list,
+        index=candidate_movie_ids,
+        name="user_fav_genre_match",
+    )
+
+    # ----------------------------------------
+    # FINAL X_cand CONSTRUCTION (NOW MATCHES TRAINING)
+    # ----------------------------------------
+    X_cand = pd.concat(
+        [
+            uf_rep[
+                [
+                    "user_avg_rating",
+                    "user_rating_std",
+                    "user_rating_count",
+                    "user_like_ratio",
+                    "user_new_release_ratio",
+                    "user_strictness",
+                ]
+            ],
+            mf[
+                [
+                    "movie_avg_rating",
+                    "movie_rating_count",
+                    "movie_popularity",
+                    "movie_like_ratio",
+                    "release_year",
+                    "years_since_release",
+                    "is_trending",
+                ]
+            ],
+            emb[nlp_cols],
+            fav_match_series,  # 🔥 added feature
+        ],
+        axis=1,
+    ).fillna(0.0)
+    # ----------------------------------------
+# FIX: Force the feature order to match training
+# ----------------------------------------
+    try:
+        X_cand = X_cand[model.feature_names_in_]
+    except Exception as e:
+        raise ValueError(
+        f"Feature mismatch.\nExpected: {list(model.feature_names_in_)}\nGot: {list(X_cand.columns)}"
+    )
+
+
+
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X_cand)[:, 1]
+    elif hasattr(model, "decision_function"):
+        scores = model.decision_function(X_cand)
+        proba = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+    else:
+        proba = model.predict(X_cand).astype(float)
+
+    recs = (
+        pd.DataFrame({"movieId": candidate_movie_ids, "pred_like_proba": proba})
+        .sort_values("pred_like_proba", ascending=False)
+        .head(top_n)
+        .merge(movies_full, on="movieId", how="left")
+    )
+
+    return recs
+
+
+def get_similar_movies(
+    movie_id: int,
+    movie_emb_df: pd.DataFrame,
+    movies_full: pd.DataFrame,
+    top_n: int = 10,
+) -> pd.DataFrame:
+
+    if movie_id not in movie_emb_df.index:
+        return pd.DataFrame()
+
+    target_vec = movie_emb_df.loc[movie_id].values
+    mat = movie_emb_df.values
+
+    norms = (np.linalg.norm(mat, axis=1) * np.linalg.norm(target_vec))
+    norms = np.where(norms == 0, 1e-9, norms)
+    sims = np.dot(mat, target_vec) / norms
+
+    sim_df = pd.DataFrame(
+        {"movieId": movie_emb_df.index.values, "similarity": sims}
+    )
+    sim_df = sim_df[sim_df["movieId"] != movie_id]
+    sim_df = sim_df.sort_values("similarity", ascending=False).head(top_n)
+    sim_df = sim_df.merge(movies_full, on="movieId", how="left")
+
+    return sim_df
