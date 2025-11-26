@@ -122,8 +122,8 @@ All raw datasets go into data/raw/
           b. Model Metrics
           c. Personalized Recommendations
           d. Similar Movie Search
+   All of this runs automatically.
 
-All of this runs automatically.
   7. Streamlit App Features
     📊 Tab 1: Data & EDA
         a. Dataset statistics
