@@ -131,14 +131,14 @@ All raw datasets go into data/raw/
         c. Rating distribution chart
         d. Top genres bar chart
 
-   Tab 2: Machine Learning Models
+      Tab 2: Machine Learning Models
         Shows:
         a. Baseline & Tuned models
         b. Accuracy, Precision, Recall, F1, ROC-AUC
         c. Hyperparameter results
         d. Auto-generated charts
 
-  👤 Tab 3: User Profiles & Recommendations
+      Tab 3: User Profiles & Recommendations
         For each selected user:
         a. Rating behaviour
         b. Top genres
@@ -149,11 +149,11 @@ All raw datasets go into data/raw/
         g. ML-Based Personalized Recommendations
         h. SVD Collaborative Filtering Recommendations
         
-  Each recommendation displays:
-        a. Poster
-        b. Title
-        c. Genres
-        d. Predicted probability/score
+        Each recommendation displays:
+           a. Poster
+           b. Title
+           c. Genres
+           d. Predicted probability/score
 
   🎞 Tab 4: Similar Movies
     → Pick a reference movie
